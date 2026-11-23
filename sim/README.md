@@ -31,18 +31,19 @@ CryptoCell-310 `nRFCrypto_AES`) is the only change and c then decodes the text. 
 model or the way the library drives it is not yet separated (no register/DMA trace compared with the CC310 docs yet; filed as pyrite#4201, related #4054).
 
 ### Reproduce (from the repo root)
-    NODES="a b c" EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
+    NODES=1 EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
     (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)
     MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > run.out 2> air.log
     # strip ANSI from run.out, then:
     uv run --with pillow sim/make_relay_gif.py air.log sim/relay.gif run.out
-Build writes sim/merged_{a,b,c}.hex (MBR + S140 + app, Nordic blob: not committed).
+Build writes sim/merged.hex (MBR + S140 + app, Nordic blob: not committed). Needs pyrite with #4257.
 
 ### How each piece was done
 - Region/channel: build-time `USERPREFS_CONFIG_LORA_REGION=US`; the channel is the stock default (LongFast, PSK AQ==). No firmware logic patched.
-- Node ids: pyrite gives every instance the same FICR DEVICEADDR (all nodes read 0xffffff4f) and a scenario cannot set it. The only firmware edit is a
-  `SIM_MAC_LSB` override in `getMacAddr()` (src/platform/nrf52/main-nrf52.cpp), one build per node (ids ffffff01/02/03 before key generation; after the first
-  boot the id becomes the CRC32 of the generated public key, so a, b, c end up with distinct random ids). Stand-in for factory identity, not logic.
+- Node ids: each machine reads its own FICR DEVICEADDR, which pyrite derives from the machine name (or a scenario `mac:`), pyrite#4251 / PR #4257.
+  No firmware edit: one image (`sim/merged.hex`) for all three. Run of 2026-11-23: pre-keygen nodenums b 0xffffffa5, c 0xfffffff2; ids a !1ee6eeb9,
+  b !1b22233f, c !68fa202d; c logs `msg=Hello from A` from 0x1ee6eeb9 at 24.83 s through b. (Before: every node read 0xffffff4f and a per-node
+  `SIM_MAC_LSB` build stood in.)
 - Send: Meshtastic serial API over USB CDC. `--usb-cdc-console NAME=text` cannot carry the frame (UTF-8 argv string: no 0x94 byte, no NUL), and
   `--usb-cdc-pty`/`--uart-pty` are single-machine only. `sim/send_text.py` is the USB host over `--usb-raw` (enumerate, DTR, want_config, one
   ToRadio TEXT_MESSAGE_APP broadcast). CDC bulk OUT is endpoint 1 (IN 0x82). After the API starts, a's debug log stops (expected).
@@ -64,7 +65,7 @@ evidence for the single-machine form. No pyrite issue filed.
 - BLE is excluded (`-DMESHTASTIC_EXCLUDE_BLUETOOTH=1`); the S140 assert below is NOT explained by NVMC tWRITE. A silicon measurement (nRF52840 DK, rev AAF0)
   gives 40.27 us per word, so pyrite's 41 us is right to within 1.7%. The `program_word_ns` sweep below only shows that a faster NVMC gets past the assert;
   its root cause is unknown (leads: READYNEXT not modelled, pyrite#4195; CPU flash-fetch stall during writes not modelled). No override is used in the demo.
-- Open: CC310 AES-CTR (pyrite#4201) so the demo can drop SIM_SOFT_AES; `--record`; per-node FICR identity in pyrite scenarios; text decoded at c.
+- Open: CC310 AES-CTR (pyrite#4201) so the demo can drop SIM_SOFT_AES; `--record`.
 
 ---
 (Earlier learning-pass notes follow; its tWRITE verdict is superseded by the correction above.)
