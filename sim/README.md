@@ -2,6 +2,34 @@
 
 ## Demo: three Meshtastic RAK4631 nodes, text a -> b -> c
 
+![scene 1: text a -> b -> c; scene 2: a and c collide at b. Every number is parsed from the two runs' logs](relay.gif)
+
+### GIF run, 2026-11-23 (pyrite main 5d187f6e5, sim 0.10.8; stock build: Bluetooth on, CC310 AES, no SIM_* flags)
+`three.yaml` connected `a.radio`/`b.radio`, but the SX1262 peer is `sx1262` since f5b535b; sim now refuses it:
+`machine 'a' connects 'radio' to a LoRa medium, but it has no scripted radio (SPI.ScriptedSpiSlave) named 'radio'`. Fixed to `a.sx1262` etc.
+- Scene 1 (relay): a TX 14.137-14.656 s (34 B), b relays 18.067-18.585 s (HopLim 3 -> 2); b reads `rxSNR=6.5 rxRSSI=-92` from a,
+  c reads `rxSNR=-9.25 rxRSSI=-118` from b; c logs `Received text msg from=0xedf2663e, id=0x5a5a0001, msg=Hello from A` at 18.656 s.
+  Node ids differ per machine (FICR from the scenario, pyrite#4257): b 0xffffffa5 / c 0xfffffff2 before key generation.
+- Scene 2 (collision, hidden terminal): a second run with both a and c typing a text (`send_text.py ... <at_us>`). The two texts did not
+  overlap usefully (the firmware's TX delay puts them either 145 ms apart, inside b's header: the peer raises HeaderErr, which the firmware
+  does not log, or 0.7 s+ apart, no overlap). In the same run c's 104 B NodeInfo (29.811-30.820 s) and a's 107 B NodeInfo (30.064-31.115 s)
+  overlapped after b had c's header: b logs `Ignore rx packet, error=-7 (... fr=0xce1e5d47 ... rxSNR=-9.25 rxRSSI=-118 ...)` at 31.463 s.
+  No retry of that frame was seen before the run ended at 40 s (NodeInfo is not acked; c's next 104 B frame starts at 39.52 s and was cut off).
+  Which frames collide varies run to run: `send_text.py` is a wall-clock host, so this scene is one observed run, not a deterministic replay.
+
+    NODES=1 EXTRA="-DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
+    # scene 1
+    (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)
+    MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > relay.out 2> relay.air
+    # scene 2
+    (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log "<a long text>" 16000000 &)
+    (uv run --with meshtastic python3 -I sim/send_text.py 7102 /tmp/c.log "Hello from C" 16500000 &)
+    MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-raw c.usbd:7102 --usb-cdc-console b.usbd --ascii --timeout 40 > collide.out 2> collide.air
+    # strip ANSI (and the '.[..m' remnants of --ascii) from the .out files, then:
+    uv run --with pillow sim/make_relay_gif.py relay.air relay.out collide.air collide.out sim/relay.gif
+
+### Earlier runs
+
 ### On the pyrite lora medium (pyrite#4211, PR #4212 build), 2026-11-22
 `sim/three.yaml` now has two `type: lora` media (a-b, b-c) instead of `quantum: 0.00001` + `MESH_LINKS`; the peer sends with
 `ctx.lora.send` and receives `on_lora` at the end of the sync word. Effective quantum 912 us (was 10 us). Same build, same commands
@@ -16,14 +44,12 @@
 c decodes the text through b in every run. Times repeat within a run mode but not across modes or for a: the text is typed by
 `send_text.py` over `--usb-raw`, a wall-clock host (the run is paced real-time, "fell behind" in stderr), so when it lands in virtual time
 depends on host speed. The MeshCore sim (CLI-typed advert, no wall-clock host) gives identical TX times and instruction counts in both modes.
-The table below and the GIF are the earlier 10 us run.
-
-![text from a reaches c only through b, from MESH_AIR_LOG and the c log](relay.gif)
+The table below is the earlier 10 us run.
 
 Run of 2026-11-22, sim 0.10.6, no BLE, region US, default LongFast (SF11 BW250 CR4/5), links a-b and b-c only, software AES (workaround below), 40 s virtual:
 - a TX start 12.559 s, 34 B, 518 ms on air (ends 13.077 s). b TX start 21.225 s, 34 B (HopLim 3 -> 2, ends 21.744 s).
 - c: `Received text msg from=0x666b7d60, id=0x5a5a0001, msg=Hello from A` at 22.323 s (c has no link to a: it can only have come through b).
-- 2.51 G / 2.55 G / 2.55 G guest insns (a/b/c), ~56-58 MIPS per node, ~38 s cpu per node. Not `--record`ed (see below). GIF numbers are the TX lines and the c log line of this run.
+- 2.51 G / 2.55 G / 2.55 G guest insns (a/b/c), ~56-58 MIPS per node, ~38 s cpu per node. Not `--record`ed (see below).
 
 Workaround, pyrite#4201: the default build fails to decrypt on every node (`Invalid protobufs ... (bad psk?)`, packets still relay opaquely, text and
 NodeInfo alike). Rebuilding with `-DSIM_SOFT_AES=1` (sim-only flag in `src/platform/nrf52/NRF52CryptoEngine.cpp`: AES-CTR uses the base-class software path instead of
@@ -43,8 +69,6 @@ c still decodes `Hello from A` through b at 18.94 s. Needs pyrite with #4257 and
     NODES="a b c" EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
     (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)
     MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > run.out 2> air.log
-    # strip ANSI from run.out, then:
-    uv run --with pillow sim/make_relay_gif.py air.log sim/relay.gif run.out
 Build writes sim/merged_{a,b,c}.hex (MBR + S140 + app, Nordic blob: not committed).
 
 ### How each piece was done

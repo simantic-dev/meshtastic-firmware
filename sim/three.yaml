@@ -6,5 +6,5 @@ machines:
   b: { mcu: NRF52840QIAA, elf: merged.hex, overlay: rak.board }
   c: { mcu: NRF52840QIAA, elf: merged.hex, overlay: rak.board }
 media:
-  - { type: lora, connect: [a.radio, b.radio], rssi: -92, snr: 6.5 }
-  - { type: lora, connect: [b.radio, c.radio], rssi: -118, snr: -9.25 }
+  - { type: lora, connect: [a.sx1262, b.sx1262], rssi: -92, snr: 6.5 }
+  - { type: lora, connect: [b.sx1262, c.sx1262], rssi: -118, snr: -9.25 }
