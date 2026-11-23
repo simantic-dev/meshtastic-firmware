@@ -258,10 +258,6 @@ void getMacAddr(uint8_t *dmac)
     dmac[2] = src[3];
     dmac[1] = src[4];
     dmac[0] = src[5] | 0xc0; // MSB high two bits get set elsewhere in the bluetooth stack
-#ifdef SIM_MAC_LSB
-    // pyrite sim only: FICR DEVICEADDR reads the same on every simulated node, so the per-node build sets the id.
-    dmac[5] = SIM_MAC_LSB;
-#endif
 }
 
 bool getBluetoothAddr(uint8_t *addr)
