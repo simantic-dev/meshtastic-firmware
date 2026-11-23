@@ -15,8 +15,10 @@
 # continuous wave / infinite preamble (these answer "failed to execute"), NRESET (the seam
 # has no input but NSS), PA ramp time, RF switch/TCXO analog behaviour.
 #
-# Over the air: there is no radio medium, so receive is fed from RX_SCHEDULE and transmitted
-# packets are recorded in `tx_log` and logged.
+# Over the air: on a scenario `lora` medium (`media: [{type: lora, connect: [a.radio, b.radio]}]`)
+# a TX goes out through `ctx.lora.send` at its first preamble symbol, and the other radios get it as
+# `on_lora(frame)` at the end of its sync word, with the medium's RSSI/SNR. Without a medium,
+# receive is fed from RX_SCHEDULE. Transmitted packets are recorded in `tx_log` either way.
 
 import math, random
 
@@ -115,13 +117,12 @@ READ_CMDS = {0xC0, 0x12, 0x13, 0x14, 0x15, 0x17, 0x11, 0x10, 0x1D, 0x1E}
 NOT_MODELLED = {0x94, 0xD1, 0xD2}
 
 
-import builtins, os
-# Radio reachability: MESH_LINKS="0-1,1-2" lists node-index pairs (machine order) that hear each other; unset = all hear all.
-LINKS = {tuple(sorted(map(int, p.split('-')))) for p in os.environ.get('MESH_LINKS', '').split(',') if p}
-NODES = builtins.__dict__.setdefault("_lora_air_nodes", [])   # the interpreter is shared by all machines of a scenario
+import builtins, os, sys
+# One count shared by every radio of a scenario (the interpreter is shared), so each gets its own
+# noise seed in machine order. Not an air: frames travel on the medium.
+_INSTANCES = builtins.__dict__.setdefault("_sx126x_instances", [0])
 
 
-import sys
 def _log(m):
     if os.environ.get('MESH_AIR_LOG'):
         print('SX1262:', m, file=sys.stderr, flush=True)
@@ -130,11 +131,12 @@ def _log(m):
 class Slave:
     def __init__(self, ctx):
         self.ctx = ctx
-        NODES.append(self)
+        _INSTANCES[0] += 1
+        self.node = _INSTANCES[0] - 1
         self.air_busy_until = 0
         # MODELED SIMPLIFICATION: section 13.4 regs 0x0819-0x081C return wideband-noise random bits on silicon;
         # here a PRNG seeded by instance order, so each node gets its own entropy (and so its own MeshCore identity).
-        self.noise = random.Random(0x5EED + len(NODES))
+        self.noise = random.Random(0x5EED + _INSTANCES[0])
         self.pins = {}
         self.events = []                   # (due_us, seq, fn)
         self.seq = 0
@@ -168,6 +170,7 @@ class Slave:
         self.rx_len = self.rx_start = 0
         self.rssi_raw = self.snr_raw = self.signal_raw = 0
         self.dio2_rf_switch = False
+        self.tx_power = 14
         self.rx_continuous = False
         self.rx_locked = False
         self.rx_deadline = None
@@ -303,7 +306,7 @@ class Slave:
         if not txn or self.asleep:
             return
         op, params = txn[0], txn[1:]
-        if op in READ_CMDS or (op == 0x00 and not params):   # 0x00 = NOP, RadioLib's wake pulse (harness patch)
+        if op in READ_CMDS or (op == 0x00 and not params):   # 0x00 = NOP, RadioLib's wake pulse
             return
         spec = WRITE_CMDS.get(op)
         if spec is None or not spec[1] <= len(params) <= spec[2]:
@@ -368,15 +371,13 @@ class Slave:
 
         def tx_started():
             self.mode = TX
-            # MODELED SIMPLIFICATION: unit-gain link between every pair of nodes, fixed RSSI/SNR, no collisions.
-            a = Air(self.now(), data, freq_hz=self.freq_hz, sf=self.sf, bw_khz=self.bw_khz, cr=self.cr,
-                    preamble=self.preamble, explicit=self.explicit, crc=self.crc,
-                    sync=self.regs[0x0740] << 8 | self.regs[0x0741], invert_iq=self.invert_iq)
             _log('  tx payload ' + data.hex())
-            _log(f'TX start node{NODES.index(self)} {len(data)}B sf{self.sf} bw{self.bw_khz} {self.freq_hz} t={self.now()}')
-            for o in NODES:
-                if o is not self and (not LINKS or tuple(sorted((NODES.index(o), NODES.index(self)))) in LINKS):
-                    o._air_start(a)
+            _log(f'TX start node{self.node} {len(data)}B sf{self.sf} bw{self.bw_khz} {self.freq_hz} t={self.now()}')
+            if self._on_medium():
+                self.ctx.lora.send(data, freq_hz=self.freq_hz, sf=self.sf, bw_hz=round(self.bw_khz * 1000),
+                                   cr=self.cr, sync_word=self.regs[0x0740] << 8 | self.regs[0x0741],
+                                   invert_iq=self.invert_iq, preamble=self.preamble, explicit=self.explicit,
+                                   crc=self.crc, ldro=bool(self.ldro), power_dbm=self.tx_power)
             if self.dio2_rf_switch:
                 self._pin(DIO2, True)
         self._at(start, tx_started)
@@ -434,22 +435,35 @@ class Slave:
                 # MODELED SIMPLIFICATION, UNMEASURED: LoRa receive frequency tolerance.
                 and abs(a.freq_hz - self.freq_hz) <= a.bw_khz * 1000 / 4)
 
-    def _air_start(self, a):
+    def _on_medium(self):
+        lora = getattr(self.ctx, "lora", None)
+        return lora is not None and lora.attached
+
+    def on_lora(self, f):
+        """A frame from the medium, at the end of its sync word."""
+        a = Air(f["start_ns"] / 1000, f["payload"], rssi_dbm=f["rssi_dbm"], snr_db=f["snr_db"],
+                freq_hz=f["freq_hz"], sf=f["sf"], bw_khz=f["bw_hz"] / 1000, cr=f["cr"],
+                preamble=f["preamble"], explicit=f["explicit"], crc=f["crc"], sync=f["sync_word"],
+                invert_iq=f["invert_iq"])
+        self._air_start(a, f["end_ns"] / 1000)
+
+    def _air_start(self, a, end_us=None):
+        """`a` started at a.at_us; RX_SCHEDULE calls this then, the medium at its sync word."""
+        toa = time_on_air_us(a.sf, a.bw_khz, a.cr, a.preamble, len(a.payload), a.explicit, a.crc, self.ldro)
+        end_us = a.at_us + toa if end_us is None else end_us
         if (a.sf, a.bw_khz) == (self.sf, self.bw_khz) and abs(a.freq_hz - self.freq_hz) <= a.bw_khz * 1000 / 4:
-            self.air_busy_until = self.now() + time_on_air_us(a.sf, a.bw_khz, a.cr, a.preamble, len(a.payload), a.explicit, a.crc, self.ldro)
-        _log(f'  air to node{NODES.index(self)} mode={self.mode} pt={self.packet_type} sf{self.sf} bw{self.bw_khz} cr{self.cr} f{self.freq_hz} sync={self.regs[0x0740]<<8|self.regs[0x0741]:04x} iq={self.invert_iq} exp={self.explicit} match={self._matches(a)} locked={self.rx_locked}')
+            self.air_busy_until = end_us
         if self.rx_locked or not self._matches(a):
             return
         self.rx_locked = True
         sym = symbol_us(a.sf, a.bw_khz)
-        t0 = self.now()
-        # MODELED SIMPLIFICATION, UNMEASURED: PreambleDetected at the end of the preamble.
-        self._at(t0 + a.preamble * sym, lambda: self._raise_irq(IRQ_PREAMBLE))
+        t0, now = a.at_us, self.now()
+        # MODELED SIMPLIFICATION, UNMEASURED: PreambleDetected at the end of the preamble (on a medium the
+        # frame arrives after its sync word, so this is raised on arrival).
+        self._at(max(now, t0 + a.preamble * sym), lambda: self._raise_irq(IRQ_PREAMBLE))
         if a.explicit:
-            self._at(t0 + (a.preamble + 4.25 + 8) * sym, lambda: self._raise_irq(IRQ_HEADERVALID))
-        toa = time_on_air_us(a.sf, a.bw_khz, a.cr, a.preamble, len(a.payload), a.explicit, a.crc,
-                             self.ldro)
-        self._at(t0 + toa, lambda: self._air_done(a))
+            self._at(max(now, t0 + (a.preamble + 4.25 + 8) * sym), lambda: self._raise_irq(IRQ_HEADERVALID))
+        self._at(max(now, end_us), lambda: self._air_done(a))
 
     def _air_done(self, a):
         _log('  rx payload ' + a.payload.hex())
@@ -537,7 +551,7 @@ class Slave:
     def _c_SetRegulatorMode(self, p): pass
     def _c_SetPaConfig(self, p): pass
     def _c_SetDIO3AsTcxoCtrl(self, p): pass
-    def _c_SetTxParams(self, p): pass
+    def _c_SetTxParams(self, p): self.tx_power = p[0] - 256 if p[0] > 127 else p[0]
     def _c_SetCadParams(self, p): self.cad_symbols = 1 << min(p[0], 4)   # CadSymbolNum 0..4 = 1,2,4,8,16 symbols
     def _c_SetLoRaSymbNumTimeout(self, p): pass
 
@@ -552,7 +566,10 @@ class Slave:
         end = ready + (getattr(self, "cad_symbols", 2) + 1) * symbol_us(self.sf, self.bw_khz)
         self._enter(RX, ready)
         def done():
-            busy = self.air_busy_until > self.now()
+            if self._on_medium():
+                busy = self.ctx.lora.on_air(self.freq_hz, self.sf, round(self.bw_khz * 1000))
+            else:
+                busy = self.air_busy_until > self.now()
             self.mode = STBY_RC
             self._raise_irq(IRQ_CADDONE | (IRQ_CADDET if busy else 0))
         self._at(end, done)

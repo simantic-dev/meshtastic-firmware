@@ -1,6 +1,23 @@
 # Meshtastic on pyrite (nRF52840, RAK4631): learning pass
 
 ## Demo: three Meshtastic RAK4631 nodes, text a -> b -> c
+
+### On the pyrite lora medium (pyrite#4211, PR #4212 build), 2026-11-22
+`sim/three.yaml` now has two `type: lora` media (a-b, b-c) instead of `quantum: 0.00001` + `MESH_LINKS`; the peer sends with
+`ctx.lora.send` and receives `on_lora` at the end of the sync word. Effective quantum 912 us (was 10 us). Same build, same commands
+(minus `MESH_LINKS`). Machine load 4-11 (1-min) during the runs.
+
+| run | quantum | wall (s) | guest insns a / b / c | cpu s per node | c `msg=Hello from A` |
+| --- | --- | --- | --- | --- | --- |
+| before, sim 0.10.6 | 10 us | 77.2 | 2.515 G / 2.554 G / 2.554 G | 38.8-41.0 | 22.323256 s |
+| after, `PYRITE_PARALLEL=0` (x2) | 912 us | 60.0 / 59.8 | 2.48 G / 2.554 G / 2.554 G | 18.0-19.8 | 23.536943 s both |
+| after, threaded (x2) | 912 us | 41.6 / 41.8 | 2.45 G / 2.554 G / 2.554 G | 21.3-25.5 | 24.851372 s both |
+
+c decodes the text through b in every run. Times repeat within a run mode but not across modes or for a: the text is typed by
+`send_text.py` over `--usb-raw`, a wall-clock host (the run is paced real-time, "fell behind" in stderr), so when it lands in virtual time
+depends on host speed. The MeshCore sim (CLI-typed advert, no wall-clock host) gives identical TX times and instruction counts in both modes.
+The table below and the GIF are the earlier 10 us run.
+
 ![text from a reaches c only through b, from MESH_AIR_LOG and the c log](relay.gif)
 
 Run of 2026-11-22, sim 0.10.6, no BLE, region US, default LongFast (SF11 BW250 CR4/5), links a-b and b-c only, software AES (workaround below), 40 s virtual:
@@ -16,7 +33,7 @@ model or the way the library drives it is not yet separated (no register/DMA tra
 ### Reproduce (from the repo root)
     NODES="a b c" EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
     (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)
-    MESH_LINKS=0-1,1-2 MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > run.out 2> air.log
+    MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > run.out 2> air.log
     # strip ANSI from run.out, then:
     uv run --with pillow sim/make_relay_gif.py air.log sim/relay.gif run.out
 Build writes sim/merged_{a,b,c}.hex (MBR + S140 + app, Nordic blob: not committed).
