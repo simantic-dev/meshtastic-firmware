@@ -1,9 +1,9 @@
 # a - b - c in a line: a and c are out of each other's range (two lora media, a-b and b-c). Run from the repo root.
 timeout: 40
 machines:
-  a: { mcu: NRF52840QIAA, elf: merged_a.hex, overlay: rak.board }
-  b: { mcu: NRF52840QIAA, elf: merged_b.hex, overlay: rak.board }
-  c: { mcu: NRF52840QIAA, elf: merged_c.hex, overlay: rak.board }
+  a: { mcu: NRF52840QIAA, elf: merged.hex, overlay: rak.board }
+  b: { mcu: NRF52840QIAA, elf: merged.hex, overlay: rak.board }
+  c: { mcu: NRF52840QIAA, elf: merged.hex, overlay: rak.board }
 media:
   - { type: lora, connect: [a.radio, b.radio] }
   - { type: lora, connect: [b.radio, c.radio] }
