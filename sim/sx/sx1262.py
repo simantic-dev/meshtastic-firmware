@@ -11,14 +11,14 @@
 #                 NSS is the slave select arrow (line 0 rising = release).
 #
 # Scope: LoRa modem (packet type 1), standby/FS/RX/TX/sleep, IRQ/DIO routing, buffer and
-# register access, BUSY timing from Table 8-2. Not modelled: GFSK, CAD, RX duty cycle,
+# register access, BUSY timing from Table 8-2. Not modelled: GFSK, RX duty cycle,
 # continuous wave / infinite preamble (these answer "failed to execute"), NRESET (the seam
 # has no input but NSS), PA ramp time, RF switch/TCXO analog behaviour.
 #
 # Over the air: there is no radio medium, so receive is fed from RX_SCHEDULE and transmitted
 # packets are recorded in `tx_log` and logged.
 
-import math
+import math, random
 
 BUSY, DIO1, DIO2, DIO3 = 0, 1, 2, 3        # ctx.gpio output lines
 
@@ -112,12 +112,29 @@ WRITE_CMDS = {
     0x00: ("ResetStats", 6, 6),
 }
 READ_CMDS = {0xC0, 0x12, 0x13, 0x14, 0x15, 0x17, 0x11, 0x10, 0x1D, 0x1E}
-NOT_MODELLED = {0x94, 0xC5, 0xD1, 0xD2}
+NOT_MODELLED = {0x94, 0xD1, 0xD2}
+
+
+import builtins, os
+# Radio reachability: MESH_LINKS="0-1,1-2" lists node-index pairs (machine order) that hear each other; unset = all hear all.
+LINKS = {tuple(sorted(map(int, p.split('-')))) for p in os.environ.get('MESH_LINKS', '').split(',') if p}
+NODES = builtins.__dict__.setdefault("_lora_air_nodes", [])   # the interpreter is shared by all machines of a scenario
+
+
+import sys
+def _log(m):
+    if os.environ.get('MESH_AIR_LOG'):
+        print('SX1262:', m, file=sys.stderr, flush=True)
 
 
 class Slave:
     def __init__(self, ctx):
         self.ctx = ctx
+        NODES.append(self)
+        self.air_busy_until = 0
+        # MODELED SIMPLIFICATION: section 13.4 regs 0x0819-0x081C return wideband-noise random bits on silicon;
+        # here a PRNG seeded by instance order, so each node gets its own entropy (and so its own MeshCore identity).
+        self.noise = random.Random(0x5EED + len(NODES))
         self.pins = {}
         self.events = []                   # (due_us, seq, fn)
         self.seq = 0
@@ -272,6 +289,8 @@ class Slave:
             addr = (self.txn[1] << 8 | self.txn[2]) + (pos - 4) if len(self.txn) > 2 else 0
             if 0x0320 <= addr < 0x0330:
                 return VERSION_STRING[addr - 0x0320]
+            if 0x0819 <= addr <= 0x081C:
+                return self.noise.getrandbits(8)
             return self.regs.get(addr, 0x00)
         if op == 0x1E:                     # ReadBuffer: offset, NOP, then data
             if pos < 3:
@@ -349,6 +368,15 @@ class Slave:
 
         def tx_started():
             self.mode = TX
+            # MODELED SIMPLIFICATION: unit-gain link between every pair of nodes, fixed RSSI/SNR, no collisions.
+            a = Air(self.now(), data, freq_hz=self.freq_hz, sf=self.sf, bw_khz=self.bw_khz, cr=self.cr,
+                    preamble=self.preamble, explicit=self.explicit, crc=self.crc,
+                    sync=self.regs[0x0740] << 8 | self.regs[0x0741], invert_iq=self.invert_iq)
+            _log('  tx payload ' + data.hex())
+            _log(f'TX start node{NODES.index(self)} {len(data)}B sf{self.sf} bw{self.bw_khz} {self.freq_hz} t={self.now()}')
+            for o in NODES:
+                if o is not self and (not LINKS or tuple(sorted((NODES.index(o), NODES.index(self)))) in LINKS):
+                    o._air_start(a)
             if self.dio2_rf_switch:
                 self._pin(DIO2, True)
         self._at(start, tx_started)
@@ -407,6 +435,9 @@ class Slave:
                 and abs(a.freq_hz - self.freq_hz) <= a.bw_khz * 1000 / 4)
 
     def _air_start(self, a):
+        if (a.sf, a.bw_khz) == (self.sf, self.bw_khz) and abs(a.freq_hz - self.freq_hz) <= a.bw_khz * 1000 / 4:
+            self.air_busy_until = self.now() + time_on_air_us(a.sf, a.bw_khz, a.cr, a.preamble, len(a.payload), a.explicit, a.crc, self.ldro)
+        _log(f'  air to node{NODES.index(self)} mode={self.mode} pt={self.packet_type} sf{self.sf} bw{self.bw_khz} cr{self.cr} f{self.freq_hz} sync={self.regs[0x0740]<<8|self.regs[0x0741]:04x} iq={self.invert_iq} exp={self.explicit} match={self._matches(a)} locked={self.rx_locked}')
         if self.rx_locked or not self._matches(a):
             return
         self.rx_locked = True
@@ -421,6 +452,7 @@ class Slave:
         self._at(t0 + toa, lambda: self._air_done(a))
 
     def _air_done(self, a):
+        _log('  rx payload ' + a.payload.hex())
         self.rx_locked = False
         self.rx_deadline = None
         for i, byte in enumerate(a.payload):
@@ -506,10 +538,23 @@ class Slave:
     def _c_SetPaConfig(self, p): pass
     def _c_SetDIO3AsTcxoCtrl(self, p): pass
     def _c_SetTxParams(self, p): pass
-    def _c_SetCadParams(self, p): pass
+    def _c_SetCadParams(self, p): self.cad_symbols = 1 << min(p[0], 4)   # CadSymbolNum 0..4 = 1,2,4,8,16 symbols
     def _c_SetLoRaSymbNumTimeout(self, p): pass
 
     def _c_SetRxDutyCycle(self, p): self._fail("SetRxDutyCycle not modelled")
-    def _c_SetCad(self, p): self._fail("SetCad not modelled")
+    def _c_SetCad(self, p):
+        # CAD_ONLY exit (RadioLib/Meshtastic): scan, raise CadDone (+CadDetected if a same-modulation frame is on the air), standby.
+        # MODELED SIMPLIFICATION, UNMEASURED: scan time = (CadSymbolNum + 1) symbols, detection = a frame with this SF/BW/freq in flight.
+        if self.packet_type != 1:
+            return self._fail("SetCad outside LoRa packet type")
+        self._abort_rf()
+        ready = self._switch(RX)
+        end = ready + (getattr(self, "cad_symbols", 2) + 1) * symbol_us(self.sf, self.bw_khz)
+        self._enter(RX, ready)
+        def done():
+            busy = self.air_busy_until > self.now()
+            self.mode = STBY_RC
+            self._raise_irq(IRQ_CADDONE | (IRQ_CADDET if busy else 0))
+        self._at(end, done)
     def _c_SetTxContinuousWave(self, p): self._fail("SetTxContinuousWave not modelled")
     def _c_SetTxInfinitePreamble(self, p): self._fail("SetTxInfinitePreamble not modelled")
