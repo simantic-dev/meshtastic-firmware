@@ -11,6 +11,11 @@ class NRF52CryptoEngine : public CryptoEngine
 
     virtual void encryptAESCtr(CryptoKey _key, uint8_t *_nonce, size_t numBytes, uint8_t *bytes) override
     {
+#ifdef SIM_SOFT_AES
+        // pyrite sim only: software AES-CTR instead of CryptoCell (CC310 AES-CTR output differs in the sim)
+        CryptoEngine::encryptAESCtr(_key, _nonce, numBytes, bytes);
+        return;
+#endif
         if (_key.length > 16) {
             // CryptoCell only accelerates AES-128; AES-256 uses the shared software CTR.
             CryptoEngine::encryptAESCtr(_key, _nonce, numBytes, bytes);

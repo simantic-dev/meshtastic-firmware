@@ -1,28 +1,24 @@
 # Meshtastic on pyrite (nRF52840, RAK4631): learning pass
 
-## Demo: three unmodified-radio-stack nodes, text a -> b -> c (partly done)
-![text packet relayed a -> b -> c, from MESH_AIR_LOG](relay.gif)
+## Demo: three Meshtastic RAK4631 nodes, text a -> b -> c
+![text from a reaches c only through b, from MESH_AIR_LOG and the c log](relay.gif)
 
-Status: the packet reaches c only through b (hop-limited relay), but c cannot decrypt it, so the message text is not shown at c.
-Run of 2026-11-22, sim 0.10.6, no BLE, region US, default LongFast (SF11 BW250 CR4/5), links a-b and b-c only:
-- a TX start 13.339 s, 34 B, 518 ms on air (ends 13.858 s); b `Lora RX` 14.135 s (HopLim 3), b re-enqueues it with HopLim 2 ("relay opaquely").
-- b TX start 22.330 s, 34 B (ends 22.848 s); c `Lora RX` 23.175 s (HopLim 2). c rebroadcasts at 31.296 s (HopLim 1), b hears it again at 31.8 s.
-- Every node logs `Invalid protobufs in received mesh packet id=0x5a5a0001 (bad psk?)` for it, and for the 104 B NodeInfo frames of the other
-  nodes too, so the failure is symmetric and not specific to the text path: AES-CTR decrypt of a received frame fails on every node.
-- 3.10 G / 3.19 G / 3.19 G guest insns (a/b/c) for 50 s virtual, 66.5 s wall (~62 MIPS per node, load from other sessions included).
-- Not shown: c decoding "Hello from A". Not `--record`ed: see "Why no --record" below. The GIF numbers are the TX start/done lines of that run (`MESH_AIR_LOG`).
+Run of 2026-11-22, sim 0.10.6, no BLE, region US, default LongFast (SF11 BW250 CR4/5), links a-b and b-c only, software AES (workaround below), 40 s virtual:
+- a TX start 12.559 s, 34 B, 518 ms on air (ends 13.077 s). b TX start 21.225 s, 34 B (HopLim 3 -> 2, ends 21.744 s).
+- c: `Received text msg from=0x666b7d60, id=0x5a5a0001, msg=Hello from A` at 22.323 s (c has no link to a: it can only have come through b).
+- 2.51 G / 2.55 G / 2.55 G guest insns (a/b/c), ~56-58 MIPS per node, ~38 s cpu per node. Not `--record`ed (see below). GIF numbers are the TX lines and the c log line of this run.
 
-Suspect (unverified, no pyrite issue filed): the nRF52 Meshtastic build does AES-128 CTR on the CryptoCell (`nRFCrypto_AES` in
-`src/platform/nrf52/NRF52CryptoEngine.cpp`). I decrypted the frame offline with the default PSK and the nonce layout of `CryptoEngine::initNonce`
-for from = A's id, the pre-key node id and 0: none yields a protobuf, so a or b (or both, asymmetrically) mis-compute CC310 AES. To separate model
-from firmware, rebuild with software AES (override `encryptAESCtr` to the base class) and rerun; that is the next step. MeshCore hit a CC310 fault of the same
-family (pyrite#4054, Ed25519).
+Workaround, pyrite#4201: the default build fails to decrypt on every node (`Invalid protobufs ... (bad psk?)`, packets still relay opaquely, text and
+NodeInfo alike). Rebuilding with `-DSIM_SOFT_AES=1` (sim-only flag in `src/platform/nrf52/NRF52CryptoEngine.cpp`: AES-CTR uses the base-class software path instead of
+CryptoCell-310 `nRFCrypto_AES`) is the only change and c then decodes the text. So the CC310 AES-CTR path differs from software in the sim; whether that is the CC310
+model or the way the library drives it is not yet separated (no register/DMA trace compared with the CC310 docs yet; filed as pyrite#4201, related #4054).
 
 ### Reproduce (from the repo root)
-    NODES="a b c" EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
+    NODES="a b c" EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
     (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)
-    MESH_LINKS=0-1,1-2 MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 50 2> air.log
-    uv run --with pillow sim/make_relay_gif.py air.log sim/relay.gif
+    MESH_LINKS=0-1,1-2 MESH_AIR_LOG=1 sim run --scenario sim/three.yaml --usb-raw a.usbd:7101 --usb-cdc-console b.usbd --usb-cdc-console c.usbd --ascii --timeout 40 > run.out 2> air.log
+    # strip ANSI from run.out, then:
+    uv run --with pillow sim/make_relay_gif.py air.log sim/relay.gif run.out
 Build writes sim/merged_{a,b,c}.hex (MBR + S140 + app, Nordic blob: not committed).
 
 ### How each piece was done
@@ -51,7 +47,7 @@ evidence for the single-machine form. No pyrite issue filed.
 - BLE is excluded (`-DMESHTASTIC_EXCLUDE_BLUETOOTH=1`); the S140 assert below is NOT explained by NVMC tWRITE. A silicon measurement (nRF52840 DK, rev AAF0)
   gives 40.27 us per word, so pyrite's 41 us is right to within 1.7%. The `program_word_ns` sweep below only shows that a faster NVMC gets past the assert;
   its root cause is unknown (leads: READYNEXT not modelled, pyrite#4195; CPU flash-fetch stall during writes not modelled). No override is used in the demo.
-- Open: AES decrypt failure above; `--record`; per-node FICR identity in pyrite scenarios; text decoded at c.
+- Open: CC310 AES-CTR (pyrite#4201) so the demo can drop SIM_SOFT_AES; `--record`; per-node FICR identity in pyrite scenarios; text decoded at c.
 
 ---
 (Earlier learning-pass notes follow; its tWRITE verdict is superseded by the correction above.)
