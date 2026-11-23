@@ -1,3 +1,4 @@
+# Link levels are declared per medium (stand-ins, not measured): a-b strong, b-c near the SF11 floor.
 # a - b - c in a line: a and c are out of each other's range (two lora media, a-b and b-c). Run from the repo root.
 timeout: 40
 machines:

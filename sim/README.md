@@ -30,6 +30,15 @@ NodeInfo alike). Rebuilding with `-DSIM_SOFT_AES=1` (sim-only flag in `src/platf
 CryptoCell-310 `nRFCrypto_AES`) is the only change and c then decodes the text. So the CC310 AES-CTR path differs from software in the sim; whether that is the CC310
 model or the way the library drives it is not yet separated (no register/DMA trace compared with the CC310 docs yet; filed as pyrite#4201, related #4054).
 
+### Per-link SNR and collisions (pyrite#4253), 2026-11-23
+`three.yaml` declares each link's level (a-b -92 dBm / 6.5 dB, b-c -118 dBm / -9.25 dB; declared stand-ins, not measured), which the peer reports
+through GetPacketStatus (DS.SX1261-2 §13.5.3). Firmware logs: b reads `SNR=6.5 RSSI=-92` on frames from a (10) and `SNR=-9.25 RSSI=-118` from c (11);
+c reads `SNR=-9.25 RSSI=-118` (20). A frame another frame on the same channel overlaps at the receiver now fails as on silicon (Table 8-4):
+overlap before the end of the header raises HeaderErr only (UNMEASURED: no RxDone, chip keeps listening), later RxDone + CrcErr. MODELED
+SIMPLIFICATION: no capture effect. In the same run a and c, which cannot hear each other, collided at b (hidden terminal: a's 107 B NodeInfo from
+20.906 s, c's 34 B from 21.473 s): b logs `Ignore rx packet, error=-7 (... fr=0xb1f70c35 ... rxSNR=6.5 rxRSSI=-92 ...)`, RadioLib's CRC mismatch.
+c still decodes `Hello from A` through b at 18.94 s. Needs pyrite with #4257 and the #4253 PR (`ctx.lora.overlapping`).
+
 ### Reproduce (from the repo root)
     NODES=1 EXTRA="-DMESHTASTIC_EXCLUDE_BLUETOOTH=1 -DSIM_SOFT_AES=1 -DUSERPREFS_CONFIG_LORA_REGION=meshtastic_Config_LoRaConfig_RegionCode_US" sim/build.sh
     (uv run --with meshtastic python3 -I sim/send_text.py 7101 /tmp/a.log &)

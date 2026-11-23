@@ -17,8 +17,11 @@
 #
 # Over the air: on a scenario `lora` medium (`media: [{type: lora, connect: [a.sx1262, b.sx1262]}]`)
 # a TX goes out through `ctx.lora.send` at its first preamble symbol, and the other radios get it as
-# `on_lora(frame)` at the end of its sync word, with the medium's RSSI/SNR. Without a medium,
-# receive is fed from RX_SCHEDULE. Transmitted packets are recorded in `tx_log` either way.
+# `on_lora(frame)` at the end of its sync word, with its link's (medium's) RSSI/SNR, which GetPacketStatus
+# reports (section 13.5.3). A frame another on the same channel overlaps (`ctx.lora.overlapping`) fails: overlap
+# before the end of its header raises HeaderErr, after it RxDone + CrcErr. MODELED SIMPLIFICATION: no capture effect,
+# any overlap corrupts the frame whatever the levels. Without a medium, receive is fed from RX_SCHEDULE.
+# Transmitted packets are recorded in `tx_log` either way.
 
 import math, random
 
@@ -445,6 +448,7 @@ class Slave:
                 freq_hz=f["freq_hz"], sf=f["sf"], bw_khz=f["bw_hz"] / 1000, cr=f["cr"],
                 preamble=f["preamble"], explicit=f["explicit"], crc=f["crc"], sync=f["sync_word"],
                 invert_iq=f["invert_iq"])
+        a.span_ns = (f["start_ns"], f["end_ns"])
         self._air_start(a, f["end_ns"] / 1000)
 
     def _air_start(self, a, end_us=None):
@@ -461,9 +465,28 @@ class Slave:
         # MODELED SIMPLIFICATION, UNMEASURED: PreambleDetected at the end of the preamble (on a medium the
         # frame arrives after its sync word, so this is raised on arrival).
         self._at(max(now, t0 + a.preamble * sym), lambda: self._raise_irq(IRQ_PREAMBLE))
+        done = None
         if a.explicit:
-            self._at(max(now, t0 + (a.preamble + 4.25 + 8) * sym), lambda: self._raise_irq(IRQ_HEADERVALID))
-        self._at(max(now, end_us), lambda: self._air_done(a))
+            def header():
+                if self._overlapped(a, self.now()):
+                    # UNMEASURED: after HeaderErr the chip drops the frame with no RxDone and keeps listening.
+                    self._cancel(done)
+                    self.rx_locked = False
+                    self.stats[2] += 1
+                    _log(f'  rx header err node{self.node}')
+                    self._raise_irq(IRQ_HEADERERR)
+                else:
+                    self._raise_irq(IRQ_HEADERVALID)
+            self._at(max(now, t0 + (a.preamble + 4.25 + 8) * sym), header)
+        done = self._at(max(now, end_us), lambda: self._air_done(a))
+
+    def _overlapped(self, a, until_us):
+        """Another frame on a's channel was on the air between a's start and until_us."""
+        if not hasattr(a, "span_ns") or not self._on_medium():
+            return False
+        spans = self.ctx.lora.overlapping(a.span_ns[0], round(until_us * 1000), a.freq_hz, a.sf, round(a.bw_khz * 1000))
+        spans.remove(a.span_ns)
+        return bool(spans)
 
     def _air_done(self, a):
         _log('  rx payload ' + a.payload.hex())
@@ -477,6 +500,9 @@ class Slave:
         self.signal_raw = max(0, min(255, round(-a.signal_rssi_dbm * 2)))
         self.stats[0] += 1
         irq = IRQ_RXDONE
+        if a.crc and self._overlapped(a, a.span_ns[1] / 1000 if hasattr(a, "span_ns") else 0):
+            a.crc_ok = False
+            _log(f'  rx crc err node{self.node}')
         if a.crc and not a.crc_ok:
             irq |= IRQ_CRCERR
             self.stats[1] += 1
