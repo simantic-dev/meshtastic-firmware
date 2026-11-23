@@ -4,7 +4,7 @@
 # Silicon revision measured: none yet (oracle: hil-setups/esp/s3-lora-v3/oracle). Anything
 # the datasheet does not define is marked UNMEASURED and is to be filled in from silicon.
 #
-# Wiring (repl):  radio: SPI.ScriptedSpiSlave @ spi2
+# Wiring (repl):  sx1262: SPI.ScriptedSpiSlave @ spi2
 #                     file: "peers/sx1262.py"
 #                     numberOfGpios: 4
 #                     0 -> <mcu BUSY input>   1 -> <mcu DIO1 input>   2 -> DIO2   3 -> DIO3
@@ -15,7 +15,7 @@
 # continuous wave / infinite preamble (these answer "failed to execute"), NRESET (the seam
 # has no input but NSS), PA ramp time, RF switch/TCXO analog behaviour.
 #
-# Over the air: on a scenario `lora` medium (`media: [{type: lora, connect: [a.radio, b.radio]}]`)
+# Over the air: on a scenario `lora` medium (`media: [{type: lora, connect: [a.sx1262, b.sx1262]}]`)
 # a TX goes out through `ctx.lora.send` at its first preamble symbol, and the other radios get it as
 # `on_lora(frame)` at the end of its sync word, with its link's (medium's) RSSI/SNR, which GetPacketStatus
 # reports (section 13.5.3). A frame another on the same channel overlaps (`ctx.lora.overlapping`) fails: overlap

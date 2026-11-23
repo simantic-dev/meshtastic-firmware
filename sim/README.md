@@ -70,9 +70,13 @@ So the earlier single-machine stall was not examined further and is not called a
 evidence for the single-machine form. No pyrite issue filed.
 
 ### Workarounds and corrections
-- BLE is excluded (`-DMESHTASTIC_EXCLUDE_BLUETOOTH=1`); the S140 assert below is NOT explained by NVMC tWRITE. A silicon measurement (nRF52840 DK, rev AAF0)
-  gives 40.27 us per word, so pyrite's 41 us is right to within 1.7%. The `program_word_ns` sweep below only shows that a faster NVMC gets past the assert;
-  its root cause is unknown (leads: READYNEXT not modelled, pyrite#4195; CPU flash-fetch stall during writes not modelled). No override is used in the demo.
+- BLE (pyrite#4252, 2026-11-23): the stock Bluetooth build now boots, advertises and relays (c decodes `Hello from A` at 25.25 s,
+  default AES). Two causes. (1) The S140 assert at 7.94 s (10.24 s with region US) was the 41 us datasheet-max tWRITE: S140 writes the
+  512-word half page inside one TIMER0 timeslot of 696 RTC ticks (21.24 ms, start RTC 0xb99, end 0xe51, check at 0x14a8c, assert
+  `svc 255` at 0x14aa6); at 41 us the write ends at RTC 0xe54, 3 ticks late. Silicon 40.27 us (pyrite PR #4197, sim >= 0.10.8)
+  fits; a board override back to 41000 faults again at the same PC. (2) This board file named the SX1262 peer `radio`, which
+  replaced the chip's nRF RADIO entry of the same name, so PPI TIMER0 COMPARE0 -> RADIO TXEN landed on nothing and S140 never
+  advertised. The peer is now `sx1262` (rak.board, three.yaml).
 - Open: CC310 AES-CTR (pyrite#4201) so the demo can drop SIM_SOFT_AES; `--record`; per-node FICR identity in pyrite scenarios; text decoded at c.
 
 ---
